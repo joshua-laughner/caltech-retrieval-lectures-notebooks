@@ -13,6 +13,8 @@ from numpy.typing import ArrayLike
 from scipy import interpolate
 from scipy.linalg import inv
 
+from typing import Optional, Tuple
+
 # Disable the over-zealous pylint variable name conventions
 # pylint: disable=invalid-name
 
@@ -966,7 +968,7 @@ class GainValueDisplay:
         self.update_output()
 
     @staticmethod
-    def plot_gain_value(k: float, sa_range: (float, float), se_range: (float, float), ylims: (float, float) | None = None, axs=None):
+    def plot_gain_value(k: float, sa_range: (float, float), se_range: (float, float), ylims: Optional[Tuple[float, float]] = None, axs=None):
         if axs is None:
             _, axs = plt.subplots(1, 2, figsize=(12,4), gridspec_kw={'wspace': 0.33})
 
