@@ -5,6 +5,8 @@ import time
 import ipywidgets as widgets
 import matplotlib
 import matplotlib.pyplot as plt
+from matplotlib.cm import ScalarMappable
+from matplotlib.colors import BoundaryNorm, CenteredNorm, Normalize
 import numpy as np
 from matplotlib import gridspec
 from numpy.typing import ArrayLike
@@ -57,6 +59,19 @@ SMALLER_FONT = 10.0
 
 # ============================================================== Helper routines
 
+def compute_gain_value(k, sa, se):
+    return sa * k * 1/(k * sa * k + se)
+
+def compute_gain_matrix(K, Sa, Se):
+    Sa_inv = np.linalg.inv(Sa)
+    Se_inv = np.linalg.inv(Se)
+    denominator = K.T @ Se_inv @ K + Sa_inv
+    numerator = K.T @ Se_inv
+    return np.linalg.inv(denominator) @ numerator
+
+def compute_ak_matrix(K, Sa, Se):
+    G = compute_gain_matrix(K, Sa, Se)
+    return G @ K
 
 def get_sigma_from_S(S: ArrayLike) -> ArrayLike:
     """Return the square root of the diagonal for a covariance matrix
@@ -907,3 +922,347 @@ def explore_retrievals():
     # Define the user interface as the fusion of the controls and the output
     ui = widgets.VBox([controls, output_collection])
     return ui
+
+
+# ---------------------- #
+# Diagnostic visualizers #
+# ---------------------- #
+
+class GainValueDisplay:
+    def __init__(self):
+        style = dict(continuous_update=False) #{'description_width': 'initial'}
+        self.controls = {
+            'k': widgets.FloatSlider(min=0.1, max=10.0, value=1.0, description='dy/dx = k', style=style),
+            'sa_range': widgets.FloatRangeSlider(min=0.1, max=10.0, value=(0.1, 9.9), description='Prior var.', style=style),
+            'se_range': widgets.FloatRangeSlider(min=0.1, max=10.0, value=(0.1, 9.9), description='Meas. var.', style=style),
+        }
+        self.display_controls = {
+            'y_range': widgets.FloatRangeSlider(min=0.0, max=10.0, value=(0.0, 1.0), description='y-axis range'),
+            'fix_yrange': widgets.Checkbox(description='Fix y range'),
+        }
+        all_controls = list(self.controls.values())
+        all_controls.extend(self.display_controls.values())
+        self.controls_box = widgets.VBox(all_controls)
+
+        self.output = widgets.Output(layout={'border': '1px solid black'})
+        self.update_output()
+        self.display = widgets.HBox([self.controls_box, self.output])
+        for control in self.controls.values():
+            control.observe(self.slider_callback, 'value')
+        for control in self.display_controls.values():
+            control.observe(self.slider_callback, 'value')
+
+    def update_output(self):
+        with self.output:
+            self.output.clear_output(wait=True)
+            values = {k: w.value for k, w in self.controls.items()}
+            if self.display_controls['fix_yrange'].value:
+                values['ylims'] = self.display_controls['y_range'].value
+
+            self.plot_gain_value(**values)
+            plt.show()
+
+    def slider_callback(self, change):
+        self.update_output()
+
+    @staticmethod
+    def plot_gain_value(k: float, sa_range: (float, float), se_range: (float, float), ylims: (float, float) | None = None, axs=None):
+        if axs is None:
+            _, axs = plt.subplots(1, 2, figsize=(12,4), gridspec_kw={'wspace': 0.33})
+
+        n_samples = 500
+        step = n_samples // 10
+        sa = np.linspace(sa_range[0], sa_range[1], n_samples)[:, np.newaxis]    
+        se = np.linspace(se_range[0], se_range[1], n_samples)[np.newaxis, :]
+        shape = (sa.size, se.size)
+        sa = np.broadcast_to(sa, shape)
+        se = np.broadcast_to(se, shape)
+        # We're not doing the actual matrix math, we doing a bunch of scalar
+        # calculations, so the transposes are omitted and we want an element-wise
+        # inverse, not a proper matrix inverse
+        g = compute_gain_value(k, sa, se)
+
+        sa = sa[:,0]
+        se = se[0,:]
+
+        ax = axs[0]
+        se_cmapper = ColorMapper.from_discrete_values(se[::step], cmap='winter')
+        for i in range(0, n_samples, step):
+            ax.plot(sa, g[:, i], color=se_cmapper(se[i]))
+        ax.set_xlabel(r'$\sigma_a^2$')
+        ax.set_ylabel('$g$')
+        ax.set_title(f'$k = {k:.2f}$')
+        plt.colorbar(se_cmapper, ax=ax, label=r'$\sigma_\epsilon^2$')
+        ax.grid(True)
+        if ylims is not None:
+            ax.set_ylim(ylims)
+
+        ax = axs[1]
+        sa_cmapper = ColorMapper.from_discrete_values(sa[::step], cmap='copper')
+        for i in range(0, n_samples, step):
+            ax.plot(se, g[i, :], color=sa_cmapper(sa[i]))
+        ax.set_xlabel(r'$\sigma_\epsilon^2$')
+        ax.set_ylabel('$g$')
+        ax.set_title(f'$k = {k:.2f}$')
+        plt.colorbar(sa_cmapper, ax=ax, label=r'$\sigma_a^2$')
+        ax.grid(True)
+        if ylims is not None:
+            ax.set_ylim(ylims)
+
+class AkMatrixDisplay:
+    def __init__(self):
+        style = dict()
+        self.reset_button = widgets.Button(description='Reset')
+        self.reset_button.on_click(self.reset)
+        self.controls = {
+            'sa1': widgets.FloatSlider(min=0.1, max=10.0, value=1.0, description='$x_{a_1}$ var.', style=style),
+            'sa2': widgets.FloatSlider(min=0.1, max=10.0, value=1.0, description='$x_{a_2}$ var.', style=style),
+            'sa12': widgets.FloatSlider(min=-10.0, max=10.0, value=0.0, description='$x_{a_{12}}$ covar.', style=style),
+            'sy1': widgets.FloatSlider(min=0.1, max=10.0, value=1.0, description='$y_1$ var.', style=style),
+            'sy2': widgets.FloatSlider(min=0.1, max=10.0, value=1.0, description='$y_2$ var.', style=style),
+            'sy3': widgets.FloatSlider(min=0.1, max=10.0, value=1.0, description='$y_3$ var.', style=style),
+            'sy12': widgets.FloatSlider(min=-10.0, max=10.0, value=0.0, description='$y_{12}$ covar.', style=style),
+            'sy13': widgets.FloatSlider(min=-10.0, max=10.0, value=0.0, description='$y_{13}$ covar.', style=style),
+            'sy23': widgets.FloatSlider(min=-10.0, max=10.0, value=0.0, description='$y_{23}$ covar.', style=style),
+            'k_clim': widgets.FloatRangeSlider(min=0.1, max=10.0, value=(0, 1), description=r'$\mathbf{K}$ lims', style=style),
+            'sa_clim': widgets.FloatSlider(min=0.1, max=10.0, value=1, description=r'$\mathbf{S}_a$ lims', style=style),
+            'se_clim': widgets.FloatSlider(min=0.1, max=10.0, value=1, description=r'$\mathbf{S}_\epsilon$ lims', style=style),
+            'a_clim': widgets.FloatSlider(min=0.1, max=10.0, value=1, description=r'$\mathbf{A}$ lims', style=style),
+            'fix_clim': widgets.Checkbox(description='Fix color ranges'),
+        }
+
+        xa_controls = widgets.HBox([self.controls[k] for k in ['sa1', 'sa2', 'sa12']] + [self.reset_button])
+        y_controls = widgets.HBox([self.controls[k] for k in ['sy1', 'sy2', 'sy3']])
+        yc_controls = widgets.HBox([self.controls[k] for k in ['sy12', 'sy13', 'sy23']])
+        clim_controls = widgets.HBox([self.controls[k] for k in ['k_clim', 'sa_clim', 'se_clim', 'a_clim', 'fix_clim']])
+        self.output = widgets.Output(layout={'border': '1px solid black'})
+        self.update_output()
+
+        self.display = widgets.VBox([xa_controls, y_controls, yc_controls, clim_controls, self.output])
+        for control in self.controls.values():
+            control.observe(self.slider_callback, 'value')
+
+    def reset(self, *_, **__):
+        for k in ['sa1', 'sa2', 'sy1', 'sy2', 'sy3']:
+            self.controls[k].value = 1.0
+        for k in ['sa12', 'sy12', 'sy13', 'sy23']:
+            self.controls[k].value = 0.0
+
+    def update_output(self):
+        with self.output:
+            self.output.clear_output(wait=True)
+            K, Sa, Se = self.make_matrices()
+            if self.controls['fix_clim'].value:
+                clims = {k: self.controls[f'{k}_clim'].value for k in ['k', 'sa', 'se', 'a']}
+            else:
+                clims = dict()
+            self.plot_ak(K, Sa, Se, clims=clims)
+            plt.show()
+
+    def make_matrices(self):
+        v = {k: w.value for k, w in self.controls.items()}
+        K = np.array([[1.0, 0.1], [0.25, 0.25], [0.1, 1.0]])
+        Sa = np.array([[v['sa1'], v['sa12']], [v['sa12'], v['sa2']]])
+        Se = np.array([
+            [v['sy1'], v['sy12'], v['sy13']],
+            [v['sy12'], v['sy2'], v['sy23']],
+            [v['sy13'], v['sy23'], v['sy3']],
+        ])
+        return K, Sa, Se
+
+    def slider_callback(self, change):
+        self.update_output()
+
+    @classmethod
+    def plot_ak(cls, K, Sa, Se, axs=None, clims=dict()):
+        A = compute_ak_matrix(K=K, Sa=Sa, Se=Se)
+
+        if axs is None:
+            _, axs = plt.subplots(1, 4, figsize=(16,3),
+                                  gridspec_kw={'width_ratios': [2, 2, 3, 2], 'wspace': 0.4})
+
+        cls._plot_matrix(axs[0], K, 'x', 'y', 'K', cmap='Greys', clim=clims.get('k', None))
+        cls._plot_matrix(axs[1], Sa, 'xa', 'xa', r'$\mathbf{S}_a$', cmap='PiYG', norm=CenteredNorm(halfrange=clims.get('sa', None)))
+        cls._plot_matrix(axs[2], Se, 'y', 'y', r'$\mathbf{S}_\epsilon$', cmap='PRGn', norm=CenteredNorm(halfrange=clims.get('se', None)))
+        cls._plot_matrix(axs[3], A, 'x', r'\hat{x}', r'$A$', cmap='coolwarm', norm=CenteredNorm(halfrange=clims.get('a', None)))
+
+    @staticmethod
+    def _plot_matrix(ax, mat, xl, yl, cl, clim=None, **kw):
+        if clim is not None:
+            vmin, vmax = clim
+        else:
+            vmin, vmax = None, None
+        h = ax.pcolormesh(mat, shading='nearest', vmin=vmin, vmax=vmax, **kw)
+        ny, nx = mat.shape
+        x = np.arange(nx) + 1
+        y = np.arange(ny) + 1
+        ax.set_xticks(x - 1)
+        ax.set_xticklabels([f'${xl}_{i}$' for i in x])
+        ax.set_yticks(y - 1)
+        ax.set_yticklabels([f'${yl}_{i}$' for i in y])
+        plt.colorbar(h, ax=ax, label=cl)
+
+# ------------- #
+# Plotting aids #
+# ------------- #
+
+class ColorMapper(ScalarMappable):
+    """
+    Map different values to colors in a colormap.
+
+    This is useful when you wish to plot multiple series whose color corresponds to a data value, but do not want to
+    use a scatter plot. This class can be instantiated in several ways:
+
+    1. Call the class directly, providing a min and max value and (optionally) a colormap to use, e.g.::
+
+        cm = ColorMapper(0, 10, cmap='viridis')
+
+    2. Use the ``from_data`` method to automatically set the min and max values to those of some sort of data array,
+       e.g.::
+
+        cm = ColorMapper.from_data(np.arange(10))
+
+    3. Use the ``from_norm`` method to specify the normalization manually. This allows the use of Matplotlib's
+       `various normalizations <https://matplotlib.org/stable/tutorials/colors/colormapnorms.html>`_ with the 
+       colormapper.
+
+    4. Use the ``from_discrete_norm`` method to set up a colormapper using any color map with discrete levels.
+       This can also be accomplished by passing a :class:`matplotlib.colors.BoundaryNorm` instance to ``from_norm``,
+       but ``from_discrete_norm`` automatically figures out the maximum number of colors in the selected colormap.
+
+    Either method accepts all keywords for :class:`matplotlib.cm.ScalarMappable` except ``norm`` which is set
+    automatically. Calling the instance will return an RGBA tuple that can be given to the ``color`` keyword of a
+    matplotlib plotting function::
+
+        pyplot.plot(np.arange(10), color=cm(5))
+
+    The instance of this class would then be used as the mappable for a colorbar, e.g.::
+
+        pyplot.colorbar(cm)
+
+    Init parameters:
+
+    :param vmin: the bottom value for the color map.
+    :type vmin: int or float
+
+    :param vmax: the top value for the color map
+    :type vmax: int or float
+
+    :param cmap: the color map to use. May be a string that gives the name of the colormap or a Colormap instance.
+    :type cmap: str or :class:`matplotlib.colors.Colormap`
+
+    :param **kwargs: additional keyword arguments passed through to :class:`matplotlib.cm.ScalarMappable`
+    """
+    def __init__(self, vmin, vmax, cmap='viridis', **kwargs):
+        norm = kwargs.pop('norm', Normalize(vmin=vmin, vmax=vmax))
+        super(ColorMapper, self).__init__(norm=norm, cmap=cmap, **kwargs)
+        # This is a necessary step for some reason. Not sure why
+        self.set_array([])
+
+    def __call__(self, value):
+        return self.to_rgba(value)
+
+    @classmethod
+    def from_norm(cls, norm, cmap='viridis', **kwargs):
+        """Create a color mapper from a :class:`matplotlib.colors.Normalize` subclass instance.
+
+        Matplotlib offers `different ways to normalize the color scale <https://matplotlib.org/stable/tutorials/colors/colormapnorms.html>`_,
+        including logarithmic and symmetric around zero. This method allows you to specify different normalizations
+        to use with a color mapper instance.
+
+        :param norm: the normalization to use
+        :type norm: :class:`matplotlib.colors.Normalize` subclass
+
+        :param cmap: the color map to use. May be a string that gives the name of the colormap or a Colormap instance.
+        :type cmap: str or :class:`matplotlib.colors.Colormap`
+
+        :param **kwargs: additional keyword arguments passed through to :class:`matplotlib.cm.ScalarMappable`
+        """
+        return cls(vmin=None, vmax=None, cmap=cmap, norm=norm, **kwargs)
+
+    @classmethod
+    def from_discrete_norm(cls, boundaries, cmap='viridis', norm_kws=dict(), **kwargs):
+        """Create a color mapper that uses discrete color levels
+
+        A :class:`matplotlib.colors.BoundaryNorm` will map data to discrete color levels pulled from a continuous color scale
+        based on bins. It also requires you to specify how many colors from the color scale to use. This is inconvenient if you
+        want to use the whole range, since scales have different numbers of colors. This method will automatically use the full
+        range of colors. If you want to use a subset of colors, construct the :class:`~matplotlib.colors.BoundaryNorm` instance
+        yourself and pass it to ``from_norm``.
+
+        :param boundaries: A sequence of boundary edges used to map values to colors. For example, [0, 1, 2] would map values between
+        0 to 1 to one color and 1 to 2 to a second.
+
+        :param cmap: the color map to use. May be a string that gives the name of the colormap or a Colormap instance.
+        :type cmap: str or :class:`matplotlib.colors.Colormap`
+
+        :param norm_kws: additional keyword arguments passed through to :class:`matplotlib.colors.BoundaryNorm`. Note that the
+        ``boundaries`` and ``ncolors`` keywords are already specified.
+
+        :param **kwargs: additional keyword arguments passed through to :class:`matplotlib.cm.ScalarMappable`
+        """
+        if isinstance(cmap, str):
+            cmap = plt.get_cmap(cmap)
+        return cls(vmin=None, vmax=None, cmap=cmap, norm=discrete_norm(boundaries, cmap, values_are_bounds=True, **norm_kws), **kwargs)
+
+    @classmethod
+    def from_discrete_values(cls, values, cmap='viridis', norm_kws=dict(), **kwargs):
+        """Create a color mappers that has one color per given value.
+
+        :param values:  Values that should be represented in the colorbar. Each unique value will have
+         its own colors.
+
+        Other parameters are identical to :meth:`from_discrete_norm`.
+        """
+        return cls(vmin=None, vmax=None, cmap=cmap, norm=discrete_norm(values, cmap, values_are_bounds=False, **norm_kws), **kwargs)
+
+    @classmethod
+    def from_data(cls, data, **kwargs):
+        """
+        Create a :class:`ColorMapper` instance from a data array, with min and max values set to those of the data.
+
+        :param data: the data array. May be any type that ``numpy.min()`` and ``numpy.max()`` will correctly return a
+         scalar value for.
+
+        :param **kwargs: additional keyword args passed through to the class __init__ method.
+
+        :return: a new class instance
+        :rtype: :class:`ColorMapper`
+        """
+        return cls(vmin=np.nanmin(data), vmax=np.nanmax(data), **kwargs)
+
+
+def discrete_norm(values, cmap='viridis', values_are_bounds=False, **norm_kws):
+    """Construct a Matplotlib normalization for discrete values
+
+    :param values: Values that should be represented in the colorbar. See ``values_are_bounds``
+     for how these are interpreted.
+
+    :param cmap: Which colormap will be used. Note that this does not automatically 
+     ensure that the plot uses this colormap, but only that the discrete color map
+     uses the full range of colors available.
+
+    :param values_are_bounds: If ``False`` (the default), then the values given are assumed
+     to be the exact values that should be displayed in the color map, and each will receive
+     its own color. If ``True``, then these are interpreted as the borders between colors,
+     with the first and last specifying the min and max values. 
+
+    :param norm_kws: Additional keyword arguments are passed through to 
+     :class:`matplotlib.colors.BoundaryNorm`.
+    """
+    if values_are_bounds:
+        boundaries = values
+    else:
+        boundaries = _vals_to_boundaries(values)
+    if isinstance(cmap, str):
+        cmap = plt.get_cmap(cmap)
+    return BoundaryNorm(boundaries=boundaries, ncolors=cmap.N, **norm_kws)
+
+
+def _vals_to_boundaries(values):
+    svalues = np.unique(values)
+    boundaries = np.zeros(svalues.size + 1)
+    boundaries[1:-1] = 0.5*(svalues[:-1] + svalues[1:]) 
+    boundaries[0] = boundaries[1] - (boundaries[2] - boundaries[1])
+    boundaries[-1] = boundaries[-2] + (boundaries[-2] - boundaries[-3])
+    return boundaries
